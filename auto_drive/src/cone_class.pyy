@@ -1,0 +1,259 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import cv2
+import rospy
+from cv_bridge import CvBridge
+from xycar_msgs.msg import xycar_motor
+from sensor_msgs.msg import Image
+import numpy as np
+import math
+import hough_drive as hough
+
+class ConeDetector:
+    def __init__(self):
+        rospy.init_node('cone_node', anonymous=True)
+        self.cone_drive_start = False
+        self.angle = 0
+        self.speed = 0
+        self.img = np.empty(shape=[480, 640, 3])
+
+        self.WIDTH = 640
+        self.HEIGHT = 480
+
+        self.obj_b = cv2.imread('/home/nvidia/xycar_ws/src/auto_drive/src/corn_data/corn1.png', cv2.IMREAD_GRAYSCALE)
+        self.obj_s = cv2.imread('/home/nvidia/xycar_ws/src/auto_drive/src/corn_data/corn2.png', cv2.IMREAD_GRAYSCALE)
+
+        self.obj_contours_b, _ = cv2.findContours(self.obj_b, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        self.obj_contours_s, _ = cv2.findContours(self.obj_s, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        self.obj_pts_b = self.obj_contours_b[0]
+        self.obj_pts_s = self.obj_contours_s[0]
+
+        self.kernel_size = 5
+        self.low_threshold = 30
+        self.high_threshold = 255
+
+        self.p_l_m = 0
+        self.p_l_n = 0
+        self.p_r_m = 0
+        self.p_r_n = 0
+
+        self.pub = rospy.Publisher('xycar_motor', xycar_motor, queue_size=1)
+        self.bridge = CvBridge()
+        rospy.Subscriber("/usb_cam/img_raw", Image, self.img_callback)
+
+    def img_callback(self, data):
+        self.img = self.bridge.imgmsg_to_cv2(data, "bgr8")
+        self.preprocess()
+        self.main()
+        msg = xycar_motor()
+        msg.angle = self.angle
+        msg.speed = self.speed
+        self.pub.publish(msg)
+
+    def preprocess(self):
+        # Implement all the image processing steps here
+        self.grayscale()
+        self.gaussian_blur()
+        self.region_of_interest()
+        self.threshold()
+        self.contours, _ = cv2.findContours(self.bigimg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        self.r_mid = []
+        self.l_mid = []
+        self.m_mid = []
+
+        for pts in self.contours:
+            if cv2.contourArea(pts) < 100:
+                continue
+            self.rc = cv2.boundingRect(pts)
+            self.dist_b = cv2.matchShapes(self.obj_pts_b, pts, cv2.CONTOURS_MATCH_I3, 0)
+            self.dist_s = cv2.matchShapes(self.obj_pts_s, pts, cv2.CONTOURS_MATCH_I3, 0)
+            if self.dist_b < 0.4 or self.dist_s < 0.2:
+                cv2.rectangle(self.bigimg, self.rc, (255, 0, 0), 1)
+                self.mid = [int((self.rc[0] * 2 + self.rc[2]) / 2), int((self.rc[1] * 2 + self.rc[3]) / 2)]
+                self.m_mid.append(self.mid)
+
+        self.depart_points()
+
+    def grayscale(self):
+        hsv = cv2.cvtColor(self.img, cv2.COLOR_BGR2HSV)
+        lower = (0, 150, 80)
+        upper = (125, 255, 255)
+        mask_hsv = cv2.inRange(hsv, lower, upper)
+        img = cv2.bitwise_and(self.img, self.img, mask=mask_hsv)
+        self.grayimg = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    def gaussian_blur(self):
+        self.gaussimg = cv2.GaussianBlur(self.grayimg, (self.kernel_size, self.kernel_size), 0)
+
+    def region_of_interest(self):
+        self.roiimg = np.zeros_like(self.img)
+        if len(self.img.shape) > 2:
+            channel_count = self.img.shape[2]
+            ignore_mask_color = (255,) * channel_count
+        else:
+            ignore_mask_color = 255
+        vertices = np.array([[(10, 305),
+                              (10, 200),
+                              (180, 150),
+                              (450, 150),
+                              (630, 200),
+                              (630, 305)]], dtype=np.int32)
+        cv2.fillPoly(self.roiimg, vertices, ignore_mask_color)
+        self.masked_image = cv2.bitwise_and(self.gaussimg, vertices)
+
+    def threshold(self):
+        _, self.edges = cv2.threshold(self.masked_image, self.low_threshold, self.high_threshold, cv2.THRESH_BINARY)
+        self.bigimg = self.edges
+
+    def depart_points(self):
+        self.r_list = []
+        self.l_list = []
+        self.center_x = int(self.WIDTH / 2)
+
+        for p in self.m_mid:
+            self.x, self.y = p
+            if self.x > self.center_x:  # Right side of the centerline
+                self.r_list.append(p)
+            else:  # Left side of the centerline
+                self.l_list.append(p)
+
+    def linear_reg(self, img, left, right):
+        if not left or not right:  # Check if either list is empty
+            linear_img = img  # Skip linear_reg calculations and return the original image
+            fin_angle = 0
+        else:
+            left_x = []
+            left_y = []
+            right_x = []
+            right_y = []
+
+            for i in range(len(left)):
+                left_x.append(left[i][0])
+                left_y.append(left[i][1])
+            for i in range(len(right)):
+                right_x.append(right[i][0])
+                right_y.append(right[i][1])
+            left_calculated_weight = 0
+            left_calculated_bias = 0
+            right_calculated_weight = 0
+            right_calculated_bias = 0
+            if len(left) < 2:
+                left_calculated_weight = self.p_l_m
+                left_calculated_bias = self.p_l_n
+            else:
+                mean_lx = np.mean(left_x)
+                mean_ly = np.mean(left_y)
+                left_calculated_weight = self.least_square(left_x, left_y, mean_lx, mean_ly)
+                left_calculated_bias = mean_ly - left_calculated_weight * mean_lx
+            target_l = left_calculated_weight * self.WIDTH + left_calculated_bias
+
+            if len(right) < 2:
+                right_calculated_weight = self.p_r_m
+                right_calculated_bias = self.p_r_n
+            else:
+                mean_rx = np.mean(right_x)
+                mean_ry = np.mean(right_y)
+                right_calculated_weight = self.least_square(right_x, right_y, mean_rx, mean_ry)
+                right_calculated_bias = mean_ry - right_calculated_weight * mean_rx
+            target_r = right_calculated_weight * self.WIDTH + right_calculated_bias
+
+            linear_img = cv2.line(img, (int(self.WIDTH / 2), self.HEIGHT), (int(self.WIDTH / 2), int(0)), (255, 0, 0), 3)
+
+            if left_calculated_weight != right_calculated_weight:  # Avoid division by zero
+                cross_x = (right_calculated_bias - left_calculated_bias) / (left_calculated_weight - right_calculated_weight)
+                cross_y = left_calculated_weight * ((right_calculated_bias - left_calculated_bias) / (left_calculated_weight - right_calculated_weight)) + left_calculated_bias
+            else:
+                # Handle the situation where the slopes are the same (division by zero)
+                # You can set cross_x and cross_y to some default values or handle it differently based on your application
+                cross_x = 0
+                cross_y = 0
+
+            if not np.isnan(cross_x) and not np.isnan(cross_y):
+                linear_img = cv2.line(img, (0, int(left_calculated_bias)), (int(self.WIDTH), int(target_l)), (0, 0, 0), 10)
+                linear_img = cv2.line(img, (int(0), int(right_calculated_bias)), (self.WIDTH, int(target_r)), (0, 0, 0), 10)
+                cv2.circle(linear_img, (int(cross_x), int(cross_y)), 10, (0, 0, 255), -1, cv2.LINE_AA)
+                if 80 < self.steering_theta(left_calculated_weight, right_calculated_weight) < 100:
+                    fin_angle = self.steering_vanishing_point(cross_x)
+                    print('Vanishing point steering servo angle:', fin_angle)
+                else:
+                    fin_angle = self.steering_theta(left_calculated_weight, right_calculated_weight)
+                    print("Gradient steering servo angle:", fin_angle)
+            self.p_l_m = left_calculated_weight
+            self.p_r_m = right_calculated_weight
+            self.p_l_n = left_calculated_bias
+            self.p_r_n = right_calculated_bias
+
+        return linear_img, fin_angle
+
+    def least_square(self, val_x, val_y, mean_x, mean_y):
+        return ((val_x - mean_x) * (val_y - mean_y)).sum() / ((val_x - mean_x) ** 2).sum()
+
+    def steering_theta(self, w1, w2):
+        if np.abs(w1) > np.abs(w2):  # Right turn
+            if w1 * w2 < 0:  # Slightly turned direction
+                w1 = -w1
+                angle = np.arctan(np.abs(math.tan(w1) - math.tan(w2)) / (1 + math.tan(w1) * math.tan(w2)))
+                theta = self.matching(angle, 0, np.pi / 2, 90, 180)
+            elif w1 * w2 > 0:  # Highly turned direction
+                if w1 > w2:
+                    theta = 90
+                else:
+                    theta = 90
+            else:
+                theta = 0
+        elif np.abs(w1) < np.abs(w2):  # Left turn
+            if w1 * w2 < 0:  # Slightly turned direction
+                w1 = -w1
+                angle = np.arctan(np.abs(math.tan(w1) - math.tan(w2)) / (1 + math.tan(w1) * math.tan(w2)))
+                theta = self.matching(angle, 0, np.pi / 2, 90, 0)
+            elif w1 * w2 > 0:  # Highly turned direction
+                if w1 > w2:
+                    theta = 90
+                else:
+                    theta = 90
+            else:
+                theta = 0
+        else:
+            theta = 90
+        return theta
+
+    def matching(self, x, input_min, input_max, output_min, output_max):
+        return (x - input_min) * (output_max - output_min) / (input_max - input_min) + output_min  # map() function definition.
+
+    def steering_vanishing_point(self, x):
+        standard_x = int(self.WIDTH / 2)
+        diff = standard_x - x
+        if diff > 0:  # Left turn
+            theta = self.matching(diff, 0, self.WIDTH / 2, 90, 45)
+        elif diff < 0:
+            theta = self.matching(diff, 0, -self.WIDTH / 2, 90, 135)
+        else:
+            theta = 0
+        return theta
+
+    def main(self):
+        if self.cone_drive_start:
+            linear_img, fin_angle = linear_reg(img, l_mid, r_mid)
+            
+            pass
+        else:
+            
+            lpos, rpos = hough.process_image(self.img)
+            center = (lpos + rpos) / 2
+            angle = -(self.WIDTH / 2 - center)
+            fin_angle = angle
+          
+            pass
+
+        cv2.imshow("Result", self.img)
+        if cv2.waitKey(10) == ord('q'):
+            cv2.destroyAllWindows()
+            rospy.signal_shutdown("Shutting down")
+
+if __name__ == '__main__':
+    try:
+        cone_detector = ConeDetector()
+        rospy.spin()
+    except rospy.ROSInterruptException:
+        pass

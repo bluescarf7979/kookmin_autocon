@@ -1,0 +1,13 @@
+<launch>
+
+  <!-- motor node -->
+  <include file="$(find xycar_motor)/launch/xycar_motor.launch" />
+
+  <!-- Lidar node -->
+  <include file="$(find xycar_lidar)/launch/xycar_lidar.launch" />
+
+  <!-- auto drive -->
+  <node name="conedrive_node" pkg="auto_drive" type="cone_lidar.py" output="screen"/>
+ 
+
+</launch>

@@ -1,0 +1,12 @@
+<launch>
+
+  <!-- motor node -->
+  <include file="$(find xycar_motor)/launch/xycar_motor.launch" />
+
+  <!-- Lidar node -->
+  <include file="$(find xycar_lidar)/launch/xycar_lidar.launch" />
+
+  <!-- auto drive -->
+  <node name="perpend_park" pkg="auto_drive" type="perpend_park.py" output="screen"/>
+
+</launch>
